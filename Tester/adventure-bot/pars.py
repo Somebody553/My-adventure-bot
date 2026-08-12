@@ -1,19 +1,19 @@
-from pathlib import Path
-from dotenv import dotenv_values
-
-BASE_DIR = Path(__file__).resolve().parent
-env_path = BASE_DIR / ".env"
-
-print("Папка скрипта:", BASE_DIR)
-print("Путь к .env:", env_path)
-print(".env существует:", env_path.exists())
-
-values = dotenv_values(env_path)
-print("Ключи из .env:", list(values.keys()))
-
-TOKEN = values.get("BOT_TOKEN") or values.get("TOKEN")
-
-if not TOKEN:
-    raise RuntimeError("BOT_TOKEN не найден. Смотрите вывод выше.")
-
-print(TOKEN)
+import asyncio
+import os
+from aiogram import Bot, Dispatcher
+from aiogram.types import Message
+from aiogram.filters import CommandStart
+from dotenv import load_dotenv
+load_dotenv() # подтягивает переменные из .env
+bot = Bot(os.getenv("BOT_TOKEN"))
+dp = Dispatcher()
+@dp.message(CommandStart())
+async def cmd_start(message: Message):
+    await message.answer("Привет! Пока я просто повторяю. Напиши что-нибудь.")
+@dp.message()
+async def echo(message: Message):
+    await message.answer(message.text or "Это было не текстовое сообщение :)")
+async def main():
+    await dp.start_polling(bot)
+if __name__ == "__main__":
+    asyncio.run(main())
