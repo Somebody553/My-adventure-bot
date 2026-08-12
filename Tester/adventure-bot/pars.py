@@ -24,12 +24,11 @@ env_path = BASE_DIR / ".env"
 values = dotenv_values(env_path)
 load_dotenv()
 # --- КОНФИГУРАЦИЯ ---
+MAX_HISTORY_MESSAGES = 20
+DB_NAME = "game_data.db"
 TOKEN = values.get("BOT_TOKEN") or values.get("TOKEN")
 GIGACHAT_CREDENTIALS = values.get("GIGACHAT_CREDENTIALS")
 proxy_url="socks5://eu8buz:zEhk8F@168.80.73.57:8000"
-MAX_HISTORY_MESSAGES = 20  # Лимит памяти для ИИ
-DB_NAME = "game_data.db"   # Файл базы данных
-
 # --- ИНИЦИАЛИЗАЦИЯ ---
 logging.basicConfig(level=logging.INFO)
 
@@ -116,7 +115,7 @@ def get_history(user_id: int, limit: int):
             LIMIT ?
         """, (user_id, limit))
         rows = cursor.fetchall()
-        rows.reverse() # Возвращаем хронологический порядок
+        rows.reverse()
         return [Messages(role=MessagesRole(row[0]), content=row[1]) for row in rows]
 
 def append_history(user_id: int, role: str, content: str):
@@ -124,6 +123,30 @@ def append_history(user_id: int, role: str, content: str):
     with sqlite3.connect(DB_NAME) as conn:
         conn.execute("INSERT INTO history (user_id, role, content) VALUES (?, ?, ?)", (user_id, role, content))
         conn.commit()
+
+def get_last_buttons(user_id: int, count: int = 2):
+    """Достает тексты кнопок из последних N ответов ассистента"""
+    with sqlite3.connect(DB_NAME) as conn:
+        cursor = conn.execute("""
+            SELECT content FROM history 
+            WHERE user_id = ? AND role = 'assistant'
+            ORDER BY id DESC 
+            LIMIT ?
+        """, (user_id, count))
+        rows = cursor.fetchall()
+        
+        last_buttons = []
+        for row in rows:
+            try:
+                data = json.loads(row[0])
+                buttons_str = data.get("b", "")
+                if buttons_str:
+                    buttons = [b.strip() for b in buttons_str.split('|') if b.strip()]
+                    last_buttons.extend(buttons)
+            except (json.JSONDecodeError, KeyError):
+                pass
+                
+        return list(set(last_buttons))
 
 # --- ПРОМПТ И ЛОГИКА ИИ ---
 CHARACTER_PROFILE = """
@@ -135,20 +158,30 @@ CHARACTER_PROFILE = """
 Формат:
 {
   "t": "Твой ответ (максимум 2 коротких предложения)",
-  "b": "Текст кнопки 1|Текст кнопки 2",
+  "b": "Текст кнопки 1|Текст кнопки 2|Текст кнопки 3",
   "m": -5,
   "s": 0,
   "e": 0,
   "bgt": 0
 }
 - "t": текст ответа от Деда Михалыча.
-- "b": строка с вариантами действий, разделёнными символом | (минимум 2, максимум 3).
+- "b": строка с вариантами действий, разделёнными символом | (СТРОГО МИНИМУМ 3 варианта действий!).
 - "m", "s", "e", "bgt": изменения статов (m=мотивация, s=сила, e=выносливость, bgt=бюджет). Если изменений нет, пиши 0.
 """
 
 SYSTEM_PROMPT = (
     "Ты гейм-мастер текстовой RPG. Всегда отыгрывай роль:\n" + CHARACTER_PROFILE
 )
+
+def create_dynamic_prompt(stats: PlayerStats, last_buttons: list) -> str:
+    """Создает динамический промпт с учетом статов и последних кнопок"""
+    base_prompt = f"{SYSTEM_PROMPT}\n\n{stats.to_prompt_str()}"
+    
+    if last_buttons:
+        buttons_list = ", ".join([f'"{btn}"' for btn in last_buttons[:10]])
+        base_prompt += f"\n\nВАЖНО: Ты НЕ ДОЛЖЕН повторять эти варианты действий последние 2-3 хода: {buttons_list}. Придумай СОВЕРШЕННО НОВЫЕ варианты!"
+    
+    return base_prompt
 
 def call_gigachat_sync(history_list: list):
     chat_request = Chat(
@@ -210,11 +243,13 @@ def parse_ai_response(raw_text: str):
 async def process_turn(update_obj, user_input_text, message_obj):
     user_id = update_obj.from_user.id
     
-    # Загружаем данные из базы (используем to_thread, чтобы не блокировать бота)
+    # Загружаем данные из базы
     stats = await asyncio.to_thread(get_user_stats, user_id)
     history = await asyncio.to_thread(get_history, user_id, MAX_HISTORY_MESSAGES)
-
-    full_system_prompt = f"{SYSTEM_PROMPT}\n\n{stats.to_prompt_str()}"
+    last_buttons = await asyncio.to_thread(get_last_buttons, user_id, 2)
+    
+    # Создаем динамический промпт
+    full_system_prompt = create_dynamic_prompt(stats, last_buttons)
     
     history_to_send = [
         Messages(role=MessagesRole.SYSTEM, content=full_system_prompt)
@@ -237,21 +272,52 @@ async def process_turn(update_obj, user_input_text, message_obj):
                     new_value = getattr(stats, stat) + value
                     setattr(stats, stat, max(0, min(100, new_value)))
             
-            # Сохраняем статы в базу
             await asyncio.to_thread(update_user_stats, user_id, stats)
             
             if stats.motivation <= 0:
                 reply_text = "💀 Мотивация на нуле! Вы ушли есть шаверму. Игра окончена. (Используйте /reset)"
                 buttons_data = []
 
-        # 🛡️ СТРАХОВКА: Если ИИ не вернул кнопки
-        if not buttons_data and stats.motivation > 0:
-            logging.warning("ИИ не вернул кнопки, применяем fallback-клавиатуру")
-            buttons_data = [
-                {"text": "🔄 Попробовать другое действие", "callback": "fallback_retry"},
-                {"text": "📊 Посмотреть мои статы", "callback": "show_stats"},
-                {"text": "🆘 Позвать Деда Михалыча на помощь", "callback": "fallback_help"}
-            ]
+        # 🛡️ СТРАХОВКА: Фильтруем повторяющиеся кнопки и гарантируем минимум 3
+        if stats.motivation > 0:
+            if not buttons_data:
+                logging.warning("ИИ не вернул кнопки, применяем fallback-клавиатуру")
+                buttons_data = [
+                    {"text": "👀 Осмотреться в зале", "callback": "fallback_look"},
+                    {"text": "🗣️ Позвать Михалыча", "callback": "fallback_call"},
+                    {"text": "🤷 Пожать плечами", "callback": "fallback_shrug"}
+                ]
+            else:
+                # Фильтруем кнопки, которые уже были в последних 2-3 ходах
+                filtered_buttons = []
+                for btn in buttons_data:
+                    btn_text_lower = btn["text"].lower().strip()
+                    # Проверяем, есть ли похожая кнопка в списке последних
+                    is_duplicate = any(
+                        last_btn.lower().strip() in btn_text_lower or btn_text_lower in last_btn.lower().strip() 
+                        for last_btn in last_buttons
+                    )
+                    if not is_duplicate:
+                        filtered_buttons.append(btn)
+                
+                # Если после фильтрации осталось меньше 3 кнопок, добавляем новые альтернативы
+                if len(filtered_buttons) < 3:
+                    new_actions = [
+                        {"text": "🏋️ Подойти к штанге", "callback": "action_barbell"},
+                        {"text": "🚶 Пройтись по залу", "callback": "action_walk"},
+                        {"text": "👀 Осмотреть тренажеры", "callback": "action_machines"},
+                        {"text": "💬 Поговорить с качком рядом", "callback": "action_talk_gym_bro"},
+                        {"text": "📱 Проверить телефон", "callback": "action_phone"},
+                        {"text": "🚰 Попить воды", "callback": "action_water"}
+                    ]
+                    used_callbacks = [btn["callback"] for btn in filtered_buttons]
+                    for action in new_actions:
+                        if len(filtered_buttons) >= 3:
+                            break
+                        if action["callback"] not in used_callbacks:
+                            filtered_buttons.append(action)
+                
+                buttons_data = filtered_buttons
 
         # Формируем компактный JSON для истории
         history_json = json.dumps({
@@ -293,6 +359,7 @@ async def cmd_start(message: types.Message):
     builder = InlineKeyboardBuilder()
     builder.button(text="💪 Осмотреться в зале", callback_data="look_around")
     builder.button(text="🗣️ Громко позвать тренера", callback_data="call_trainer")
+    builder.button(text="🚪 Развернуться и уйти", callback_data="run_away")
     builder.adjust(1)
     
     await message.answer(
@@ -324,6 +391,12 @@ async def handle_button_click(callback: types.CallbackQuery):
         action_text = "[Игрок растерялся и хочет попробовать что-то другое]"
     elif callback.data == "fallback_help":
         action_text = "[Игрок кричит: 'Дед Михалыч, помоги!']"
+    elif callback.data == "fallback_look":
+        action_text = "[Игрок осматривается в зале]"
+    elif callback.data == "fallback_call":
+        action_text = "[Игрок зовет Деда Михалыча]"
+    elif callback.data == "fallback_shrug":
+        action_text = "[Игрок пожимает плечами]"
     else:
         action_text = f"[Игрок выбрал действие: {callback.data}]"
         
@@ -332,7 +405,6 @@ async def handle_button_click(callback: types.CallbackQuery):
 @dp.callback_query(F.data == "show_stats")
 async def show_stats_callback(callback: types.CallbackQuery):
     await callback.answer()
-    # Берем статы из базы
     stats = await asyncio.to_thread(get_user_stats, callback.from_user.id)
     
     builder = InlineKeyboardBuilder()
@@ -349,7 +421,6 @@ async def show_stats_callback(callback: types.CallbackQuery):
 
 # --- ЗАПУСК ---
 async def main():
-    # Инициализируем базу данных перед запуском бота
     await asyncio.to_thread(init_db)
     await dp.start_polling(bot)
 
