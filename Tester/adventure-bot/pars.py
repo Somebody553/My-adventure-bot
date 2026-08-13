@@ -5,25 +5,34 @@ import re
 import sqlite3
 import base64
 import random
+import time  # ⏳ Для задержек между попытками генерации
 from dataclasses import dataclass
-
+import os
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.types import BufferedInputFile
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.utils.keyboard import InlineKeyboardBuilder
-
+from dotenv import load_dotenv, dotenv_values
 from gigachat import GigaChat
 from gigachat.models import Chat, Messages, MessagesRole
+from pathlib import Path
 
+BASE_DIR = Path(__file__).resolve().parent
+env_path = BASE_DIR / ".env"
+
+values = dotenv_values(env_path)
+load_dotenv()
 # --- КОНФИГУРАЦИЯ ---
 MAX_HISTORY_MESSAGES = 20
 DB_NAME = "game_data.db"
 
 # 🎯 ВАШИ КЛЮЧИ (замените на реальные или используйте .env)
-BOT_TOKEN = "YOUR_BOT_TOKEN"
-GIGACHAT_CREDENTIALS = "YOUR_CREDENTIALS"
-proxy_url = None  # Пример: "http://user:pass@proxy.com:8080"
+TOKEN = values.get("BOT_TOKEN") or values.get("TOKEN")
+GIGACHAT_CREDENTIALS = values.get("GIGACHAT_CREDENTIALS")
+
+# Укажите прокси, если требуется, иначе оставьте None
+proxy_url="socks5://eu8buz:zEhk8F@168.80.73.57:8000"
 
 # 🎨 Единый визуальный стиль для всех генерируемых изображений
 IMAGE_STYLE = (
@@ -66,6 +75,7 @@ START_TEXT = (
     "/start — начать игру\n"
     "/new — очистить диалог и начать заново\n"
     "/reset — сбросить прогресс\n"
+    "/help — Справка о имеющихся командах\n"
     "📊 Мои статы — посмотреть характеристики"
 )
 
@@ -82,6 +92,7 @@ NEW_GAME_TEXT = (
     "/start — начать игру\n"
     "/new — полная очистка и рестарт\n"
     "/reset — быстрый сброс прогресса\n"
+    "/help — Справка о имеющихся командах\n"
     "📊 Мои статы — посмотреть характеристики"
 )
 
@@ -89,13 +100,15 @@ NEW_GAME_TEXT = (
 logging.basicConfig(level=logging.INFO)
 
 session = AiohttpSession(proxy=proxy_url) if proxy_url else AiohttpSession()
-bot = Bot(token=BOT_TOKEN, session=session)
+bot = Bot(token=TOKEN, session=session)
 dp = Dispatcher()
 
+# ⏳ ВАЖНО: таймаут увеличен до 10 минут, чтобы Kandinsky успевал нагенерировать картинку
 giga = GigaChat(
     credentials=GIGACHAT_CREDENTIALS,
     scope="GIGACHAT_API_PERS",
     verify_ssl_certs=False,
+    timeout=600.0
 )
 
 # --- КЛАСС ДЛЯ ХРАНЕНИЯ СТАТОВ ---
@@ -305,11 +318,19 @@ SYSTEM_PROMPT = (
     "Ты гейм-мастер текстовой RPG. Всегда отыгрывай роль:\n" + CHARACTER_PROFILE
 )
 
-def create_dynamic_prompt(stats: PlayerStats, last_buttons: list) -> str:
+def create_dynamic_prompt(stats: PlayerStats, last_buttons: list, force_image: bool = False) -> str:
     base_prompt = f"{SYSTEM_PROMPT}\n\n{stats.to_prompt_str()}"
     if last_buttons:
         buttons_list = ", ".join([f'"{btn}"' for btn in last_buttons[:10]])
         base_prompt += f"\n\nВАЖНО: Ты НЕ ДОЛЖЕН повторять эти варианты действий последние 2-3 хода: {buttons_list}. Придумай СОВЕРШЕННО НОВЫЕ варианты!"
+    
+    # 🚨 Жесткое требование сгенерировать картинку, если наступил нужный ход
+    if force_image:
+        base_prompt += (
+            "\n\n🚨 ВНИМАНИЕ: СЕЙЧАС НУЖНО СГЕНЕРИРОВАТЬ ИЗОБРАЖЕНИЕ! 🚨\n"
+            "Ты ОБЯЗАН заполнить поле 'img' детальным описанием НА АНГЛИЙСКОМ ЯЗЫКЕ (15-25 слов).\n"
+            "НЕ ОСТАВЛЯЙ ЕГО ПУСТЫМ. Опиши Деда Михалыча, зал, оборудование и атмосферу."
+        )
     return base_prompt
 
 def call_gigachat_sync(history_list: list):
@@ -321,34 +342,54 @@ def call_gigachat_sync(history_list: list):
     )
     return giga.chat(chat_request)
 
+# 🔄 ОБНОВЛЕННАЯ ФУНКЦИЯ: с циклом повторных попыток и логированием
 def generate_gigachat_image_sync(img_prompt: str) -> bytes | None:
-    full_prompt = f"{img_prompt}, {IMAGE_STYLE}"
+    full_prompt = f"{img_prompt}, {IMAGE_STYLE}".strip()
     
     chat_request = Chat(
         messages=[
+            Messages(role=MessagesRole.SYSTEM, content="You are an image generation assistant. You only output image generation prompts."),
             Messages(role=MessagesRole.USER, content=f"Нарисуй: {full_prompt}")
         ],
         function_call="auto",
+        temperature=0.5,
+        top_p=0.9
     )
-    try:
-        response = giga.chat(chat_request)
-        content = response.choices[0].message.content
-        
-        match = re.search(r'<img\s+src="([^"]+)"', content)
-        if not match:
-            logging.warning("GigaChat не вернул тег <img> в ответе на генерацию.")
+    
+    # Делаем до 3 попыток, так как сервера генерации картинок часто отваливаются по таймауту
+    for attempt in range(3):
+        try:
+            response = giga.chat(chat_request)
+            content = response.choices[0].message.content
+            
+            # Ищем тег <img>
+            match = re.search(r'<img\s+src="([^"]+)"', content)
+            if match:
+                file_id = match.group(1)
+            else:
+                # Фоллбэк: иногда API возвращает просто UUID файла вместо тега
+                match_id = re.search(r'[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}', content)
+                if match_id:
+                    file_id = match_id.group(0)
+                else:
+                    logging.warning(f"GigaChat не вернул тег <img> или UUID. Ответ: {content}")
+                    return None
+                    
+            image_obj = giga.get_image(file_id)
+            
+            if hasattr(image_obj, 'content'):
+                return base64.b64decode(image_obj.content)
+            
             return None
             
-        file_id = match.group(1)
-        image_obj = giga.get_image(file_id)
-        
-        if hasattr(image_obj, 'content'):
-            return base64.b64decode(image_obj.content)
-        
-        return None
-    except Exception as e:
-        logging.error(f"Ошибка генерации изображения: {e}")
-        return None
+        except Exception as e:
+            logging.warning(f"⚠️ Попытка генерации {attempt + 1} не удалась: {e}")
+            if attempt < 2:
+                logging.info("Ждем 5 секунд перед повторной попыткой...")
+                time.sleep(5)  # Ждем 5 секунд перед повтором
+            else:
+                logging.error(f"❌ Ошибка генерации изображения после 3 попыток: {e}")
+                return None
 
 def heal_json(json_str: str) -> str:
     json_str = json_str.replace('\r', ' ').replace('\n', ' ').replace('\t', ' ')
@@ -360,6 +401,16 @@ def heal_json(json_str: str) -> str:
     return json_str
 
 def parse_ai_response(raw_text: str):
+    # 🧹 Очищаем от возможных markdown-блоков, которые иногда выдает GigaChat
+    raw_text = raw_text.strip()
+    if raw_text.startswith("```json"):
+        raw_text = raw_text[7:]
+    if raw_text.startswith("```"):
+        raw_text = raw_text[3:]
+    if raw_text.endswith("```"):
+        raw_text = raw_text[:-3]
+    raw_text = raw_text.strip()
+
     match = re.search(r'\{.*\}', raw_text, re.DOTALL)
     json_str = match.group(0) if match else raw_text
     
@@ -372,7 +423,7 @@ def parse_ai_response(raw_text: str):
         try:
             data = json.loads(heal_json(json_str))
         except json.JSONDecodeError:
-            logging.warning(f"Failed to parse JSON even after healing.")
+            logging.warning(f"Failed to parse JSON. Raw text: {raw_text}")
             return raw_text, [], {}, ""
 
     text = str(data.get("t", raw_text))
@@ -436,7 +487,8 @@ async def process_turn(update_obj, user_input_text, message_obj, human_action: s
     if should_generate_image:
         await asyncio.to_thread(schedule_next_image, user_id, turn_count)
     
-    full_system_prompt = create_dynamic_prompt(stats, last_buttons)
+    # 🚨 Передаем флаг force_image, если нужно сгенерировать картинку
+    full_system_prompt = create_dynamic_prompt(stats, last_buttons, force_image=should_generate_image)
     
     history_to_send = [
         Messages(role=MessagesRole.SYSTEM, content=full_system_prompt)
@@ -484,8 +536,10 @@ async def process_turn(update_obj, user_input_text, message_obj, human_action: s
         
         await asyncio.to_thread(update_user_stats, user_id, stats)
         
+        # 1. Окончание игры (пройдено 7 дней)
         if game_finished:
-            await message_obj.answer(reply_text)
+            if reply_text:
+                await message_obj.answer(reply_text)
             await message_obj.answer(
                 "🎓 **Поздравляю, боец!**\n\n"
                 "Ты прошёл все 7 дней в 'Железном Подвале'. Дед Михалыч жмёт тебе руку:\n"
@@ -499,29 +553,59 @@ async def process_turn(update_obj, user_input_text, message_obj, human_action: s
                 "Используй /new, чтобы начать заново."
             )
             return
-        
+
+        # 2. Мотивация упала до нуля
         if stats.motivation <= 0:
             reply_text = "💀 Мотивация на нуле! Вы ушли есть шаверму. Игра окончена. (Используйте /new)"
             buttons_data = []
             img_prompt = ""
             should_generate_image = False
 
+        # 3. Логическое завершение дня (достигнут лимит ходов или триггер)
+        elif day_advanced:
+            if reply_text:
+                await message_obj.answer(reply_text)
+                
+            end_day_plaque = (
+                f"🛑 **ТРЕНИРОВКА ОКОНЧЕНА**\n\n"
+                f"Дед Михалыч смотрит на старые советские часы на стене.\n"
+                f"'Всё, боец. Зал закрывается. Иди домой, ешь мясо и вали спать. Завтра веса будут больше.'\n\n"
+                f"🌙 **День {stats.current_day - 1} завершён.**\n"
+                f"📅 Наступает день **{stats.current_day}** из {MAX_DAYS}.\n\n"
+                f"📈 Ваши новые рабочие веса:\n"
+                f"🏋️ Жим лёжа: {stats.bench_press} кг\n"
+                f"🦵 Присед: {stats.squat} кг\n"
+                f"💪 Становая тяга: {stats.deadlift} кг"
+            )
+            
+            builder = InlineKeyboardBuilder()
+            builder.button(text="☀️ Начать новый день", callback_data="start_next_day")
+            builder.button(text="📊 Мои статы", callback_data="show_stats")
+            builder.adjust(1)
+            
+            await message_obj.answer(end_day_plaque, reply_markup=builder.as_markup())
+            
+            history_json = json.dumps({
+                "t": end_day_plaque,
+                "b": "Начать новый день",
+                "m": stats_change.get("motivation", 0),
+                "s": stats_change.get("strength", 0),
+                "e": stats_change.get("endurance", 0),
+                "bgt": stats_change.get("budget", 0)
+            }, ensure_ascii=False)
+            await asyncio.to_thread(append_history, user_id, MessagesRole.USER.value, user_input_text)
+            await asyncio.to_thread(append_history, user_id, MessagesRole.ASSISTANT.value, history_json)
+            return
+
+        # Далее идет стандартная обработка ответа ИИ, если день НЕ закончился
         if stats.motivation > 0:
-            if not buttons_data or day_end_triggered:
-                if day_end_triggered or day_advanced:
-                    logging.info("Применяем стартовую клавиатуру для нового дня")
-                    buttons_data = [
-                        {"text": "🚪 Войти в зал", "callback": "enter_gym"},
-                        {"text": "👀 Осмотреться", "callback": "fallback_look"},
-                        {"text": "🗣️ Найти Михалыча", "callback": "call_trainer"}
-                    ]
-                else:
-                    logging.warning("ИИ не вернул кнопки, применяем fallback-клавиатуру")
-                    buttons_data = [
-                        {"text": "👀 Осмотреться в зале", "callback": "fallback_look"},
-                        {"text": "🗣️ Позвать Михалыча", "callback": "fallback_call"},
-                        {"text": "🤷 Пожать плечами", "callback": "fallback_shrug"}
-                    ]
+            if not buttons_data:
+                logging.warning("ИИ не вернул кнопки, применяем fallback-клавиатуру")
+                buttons_data = [
+                    {"text": "👀 Осмотреться в зале", "callback": "fallback_look"},
+                    {"text": "🗣️ Позвать Михалыча", "callback": "fallback_call"},
+                    {"text": "🤷 Пожать плечами", "callback": "fallback_shrug"}
+                ]
             else:
                 filtered_buttons = []
                 for btn in buttons_data:
@@ -573,11 +657,14 @@ async def process_turn(update_obj, user_input_text, message_obj, human_action: s
             builder.button(text="📊 Мои статы", callback_data="show_stats")
             keyboard = builder.as_markup()
 
-        img_prompt_final = img_prompt
-        if not img_prompt_final:
-            img_prompt_final = human_action if human_action else user_input_text
+        # 🎨 Логика генерации и отправки фото
+        img_prompt_final = img_prompt.strip()
+        
+        # 🛡️ Если ИИ не дал промпт или дал слишком короткий, используем атмосферный запасной вариант
+        if not img_prompt_final or len(img_prompt_final.split()) < 4:
+            img_prompt_final = "dark atmospheric soviet basement gym, rusty old iron equipment, harsh fluorescent lighting, cinematic composition, gritty realism"
 
-        if img_prompt_final and stats.motivation > 0 and should_generate_image and not day_end_triggered:
+        if img_prompt_final and stats.motivation > 0 and should_generate_image:
             await bot.send_chat_action(message_obj.chat.id, "upload_photo")
             try:
                 image_bytes = await asyncio.to_thread(generate_gigachat_image_sync, img_prompt_final)
@@ -585,30 +672,21 @@ async def process_turn(update_obj, user_input_text, message_obj, human_action: s
                 if image_bytes:
                     photo = BufferedInputFile(image_bytes, filename="scene.jpg")
                     
-                    if len(reply_text) <= 1000:
-                        await message_obj.answer_photo(photo=photo, caption=reply_text, reply_markup=keyboard)
+                    # Страховка от пустого текста и лимита Telegram (1024 символа для caption)
+                    caption = reply_text if reply_text else "🖼️ Сцена из зала..."
+                    if len(caption) <= 1000:
+                        await message_obj.answer_photo(photo=photo, caption=caption, reply_markup=keyboard)
                     else:
                         await message_obj.answer(reply_text, reply_markup=keyboard)
-                        await message_obj.answer_photo(photo=photo)
+                        await message_obj.answer_photo(photo=photo, caption="🖼️ Сцена из зала...")
                 else:
+                    # Если генерация упала, просто отправляем текст
                     await message_obj.answer(reply_text, reply_markup=keyboard)
             except Exception as e:
-                logging.error(f"GigaChat image generation error: {e}")
+                logging.error(f"GigaChat image generation or Telegram send error: {e}")
                 await message_obj.answer(reply_text, reply_markup=keyboard)
         else:
             await message_obj.answer(reply_text, reply_markup=keyboard)
-        
-        if day_advanced:
-            await message_obj.answer(
-                f"🌅 **День {stats.current_day} из {MAX_DAYS}**\n\n"
-                f"Дед Михалыч кивает: 'Неплохо, боец. Но сегодня работаем тяжелее.'\n\n"
-                f"📈 Рабочие веса выросли:\n"
-                f"🏋️ Жим лёжа: {stats.bench_press} кг\n"
-                f"🦵 Присед: {stats.squat} кг\n"
-                f"💪 Становая тяга: {stats.deadlift} кг\n\n"
-                f"💪 Сила: {stats.strength} | ⚡ Выносливость: {stats.endurance} | "
-                f"🔥 Мотивация: {stats.motivation}"
-            )
 
     except Exception as e:
         logging.error(f"GigaChat API error: {e}")
@@ -640,14 +718,11 @@ async def cmd_start(message: types.Message):
 @dp.message(Command("new"))
 async def cmd_new(message: types.Message):
     """🧹 Команда /new — сбрасывает игру и удаляет сообщение команды"""
-    # Пытаемся удалить сообщение с командой для эффекта "чистого диалога"
     try:
         await message.delete()
     except Exception as e:
-        # В некоторых чатах (групповых) удаление может не сработать — не страшно
         logging.warning(f"Не удалось удалить сообщение команды /new: {e}")
     
-    # 🔄 Используем специальный текст с разделителем
     await send_welcome(message, welcome_text=NEW_GAME_TEXT)
 
 
@@ -664,32 +739,46 @@ async def cmd_reset(message: types.Message):
         "💡 Используй /new, чтобы очистить диалог полностью.",
         reply_markup=builder.as_markup()
     )
+    
+@dp.message(Command("help"))
+async def cmd_help(message: types.Message):
+    await message.answer(
+        "💡 /start — новая игра\n"
+        "💡 /new — очистить память и диалог полностью.\n"
+        "💡 /reset — сбросить прогресс"
+    )
 
 
+# --- ПОКАЗ СТАТИСТИКИ (КОМПАКТНО, БЕЗ ВОДЫ) ---
 async def send_stats(target):
     user_id = target.from_user.id
     stats = await asyncio.to_thread(get_user_stats, user_id)
     
-    builder = InlineKeyboardBuilder()
-    builder.button(text="⬅️ Вернуться к тренировке", callback_data="look_around")
+    # Проверка: завершена ли игра
+    if stats.current_day > MAX_DAYS:
+        day_info = f"День: {MAX_DAYS}/{MAX_DAYS} (ЗАВЕРШЕНО)"
+    else:
+        day_info = f"День: {stats.current_day}/{MAX_DAYS} | Ход: {stats.day_turn_count}/{TURNS_PER_DAY}"
+    
+    # Сумма троеборья
+    total_lift = stats.bench_press + stats.squat + stats.deadlift
     
     text = (
-        f"📊 **Ваши характеристики**\n\n"
-        f"📅 День: {stats.current_day}/{MAX_DAYS} (ход {stats.day_turn_count}/{TURNS_PER_DAY})\n\n"
+        f"📊 {day_info}\n\n"
         f"💪 Сила: {stats.strength}\n"
-        f"⚡ Выносливость: {stats.endurance}\n"
-        f"🔥 Мотивация: {stats.motivation}\n"
+        f"🫀 Выносливость: {stats.endurance}\n"
+        f"🔥 Мотивация: {stats.motivation}/100\n"
         f"💰 Бюджет: {stats.budget} руб.\n\n"
-        f"🏋️ **Рабочие веса:**\n"
-        f"Жим лёжа: {stats.bench_press} кг\n"
-        f"Присед: {stats.squat} кг\n"
-        f"Становая тяга: {stats.deadlift} кг"
+        f"🏋️ Жим: {stats.bench_press} кг\n"
+        f"🦵 Присед: {stats.squat} кг\n"
+        f"💪 Тяга: {stats.deadlift} кг\n"
+        f"📈 Сумма: {total_lift} кг"
     )
     
     if isinstance(target, types.CallbackQuery):
-        await target.message.answer(text, reply_markup=builder.as_markup())
+        await target.message.answer(text)
     else:
-        await target.answer(text, reply_markup=builder.as_markup())
+        await target.answer(text)
 
 
 @dp.message(F.text)
@@ -704,6 +793,11 @@ async def handle_text(message: types.Message):
 @dp.callback_query(F.data)
 async def handle_button_click(callback: types.CallbackQuery):
     await callback.answer()
+    
+    # 📊 Показ статов — НЕ считаем как ход игры
+    if callback.data == "show_stats":
+        await send_stats(callback)
+        return
     
     if callback.data == "fallback_retry":
         action_text = "[Игрок растерялся и хочет попробовать что-то другое]"
@@ -720,6 +814,11 @@ async def handle_button_click(callback: types.CallbackQuery):
     elif callback.data == "fallback_shrug":
         action_text = "[Игрок пожимает плечами]"
         human_action = "Игрок недоуменно пожимает плечами"
+    elif callback.data == "start_next_day":
+        action_text = "[Игрок заходит в зал на следующий день]"
+        human_action = "Я пришёл на тренировку на следующий день. Зал открыт?"
+        await process_turn(callback, action_text, callback.message, human_action=human_action)
+        return
     else:
         button_text = ""
         try:
@@ -739,11 +838,6 @@ async def handle_button_click(callback: types.CallbackQuery):
         
     await process_turn(callback, action_text, callback.message, human_action=human_action)
 
-
-@dp.callback_query(F.data == "show_stats")
-async def show_stats_callback(callback: types.CallbackQuery):
-    await callback.answer()
-    await send_stats(callback)
 
 # --- ЗАПУСК ---
 async def main():
